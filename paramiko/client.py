@@ -36,6 +36,7 @@ from paramiko.ed25519key import Ed25519Key
 from paramiko.hostkeys import HostKeys
 from paramiko.rsakey import RSAKey
 from paramiko.ssh_exception import (
+    AuthenticationException,
     BadHostKeyException,
     NoValidConnectionsError,
     SSHException,
@@ -662,6 +663,7 @@ class SSHClient(ClosingContextManager):
         saved_exception = None
         two_factor = False
         allowed_types = set()
+        partial_auth = None
         two_factor_types = {"keyboard-interactive", "password"}
         if passphrase is None and password is not None:
             passphrase = password
@@ -678,7 +680,7 @@ class SSHClient(ClosingContextManager):
                     self._transport.auth_publickey(username, pkey)
                 )
                 two_factor = allowed_types & two_factor_types
-                if not two_factor:
+                if not allowed_types:
                     return
             except SSHException as e:
                 saved_exception = e
@@ -696,7 +698,7 @@ class SSHClient(ClosingContextManager):
                             self._transport.auth_publickey(username, key)
                         )
                         two_factor = allowed_types & two_factor_types
-                        if not two_factor:
+                        if not allowed_types:
                             return
                         break
                     except SSHException as e:
@@ -716,7 +718,7 @@ class SSHClient(ClosingContextManager):
                         self._transport.auth_publickey(username, key)
                     )
                     two_factor = allowed_types & two_factor_types
-                    if not two_factor:
+                    if not allowed_types:
                         return
                     break
                 except SSHException as e:
@@ -755,7 +757,7 @@ class SSHClient(ClosingContextManager):
                         self._transport.auth_publickey(username, key)
                     )
                     two_factor = allowed_types & two_factor_types
-                    if not two_factor:
+                    if not allowed_types:
                         return
                     break
                 except (SSHException, IOError) as e:
@@ -763,17 +765,30 @@ class SSHClient(ClosingContextManager):
 
         if password is not None:
             try:
-                self._transport.auth_password(username, password)
-                return
+                allowed_types = set(
+                    self._transport.auth_password(username, password)
+                )
+                if not allowed_types:
+                    return
+                partial_auth = allowed_types
             except SSHException as e:
                 saved_exception = e
         elif two_factor:
             try:
-                self._transport.auth_interactive_dumb(username)
-                return
+                allowed_types = set(
+                    self._transport.auth_interactive_dumb(username)
+                )
+                if not allowed_types:
+                    return
+                partial_auth = allowed_types
             except SSHException as e:
                 saved_exception = e
 
+        if partial_auth:
+            raise AuthenticationException(
+                "Authentication failed; additional methods required: "
+                + ", ".join(sorted(partial_auth))
+            )
         # if we got an auth-failed exception earlier, re-raise it
         if saved_exception is not None:
             raise saved_exception

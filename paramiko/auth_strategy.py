@@ -158,6 +158,24 @@ class OnDiskPrivateKey(PrivateKey):
 SourceResult = namedtuple("SourceResult", ["source", "result"])
 
 
+def _auth_complete(result):
+    """
+    Return whether a source's auth result means authentication is complete.
+
+    Transport auth methods return the list of authentication methods the
+    server still allows at the next step. Only an empty result means the
+    authentication is actually finished; a non-empty result is a partial
+    success which requires another source.
+
+    Non-sized return values (such as ``None`` from custom sources) are
+    treated as success for backwards compatibility.
+    """
+    try:
+        return not len(result)
+    except TypeError:
+        return True
+
+
 # TODO: tempting to make this an OrderedDict, except the keys essentially want
 # to be rich objects (AuthSources) which do not make for useful user indexing?
 # TODO: members being vanilla tuples is pretty old-school/expedient; they
@@ -277,11 +295,9 @@ class AuthStrategy:
             self.log.debug(f"Trying {source}")
             try:  # NOTE: this really wants to _only_ wrap the authenticate()!
                 result = source.authenticate(transport)
-                succeeded = True
-            # TODO: 'except PartialAuthentication' is needed for 2FA and
-            # similar, as per old SSHClient.connect - it is the only way
-            # AuthHandler supplies access to the 'name-list' field from
-            # MSG_USERAUTH_FAILURE, at present.
+                succeeded = _auth_complete(result)
+            # NOTE: partial 2FA-style success is signaled by a non-empty
+            # return value, so the next source in this strategy gets a chance.
             except Exception as e:
                 result = e
                 # TODO: look at what this could possibly raise, we don't really
