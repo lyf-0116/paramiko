@@ -30,6 +30,7 @@ from functools import wraps
 
 from paramiko import util
 from paramiko.common import (
+    MAX_WINDOW_SIZE,
     cMSG_CHANNEL_REQUEST,
     cMSG_CHANNEL_WINDOW_ADJUST,
     cMSG_CHANNEL_DATA,
@@ -1059,10 +1060,22 @@ class Channel(ClosingContextManager):
 
     def _window_adjust(self, m):
         nbytes = m.get_int()
+        if nbytes > MAX_WINDOW_SIZE:
+            raise SSHException(
+                "Peer sent window adjustment of {!r}, outside the allowed "
+                "range (0, {})".format(nbytes, MAX_WINDOW_SIZE)
+            )
         self.lock.acquire()
         try:
             if self.ultra_debug:
                 self._log(DEBUG, "window up {}".format(nbytes))
+            if self.out_window_size + nbytes > MAX_WINDOW_SIZE:
+                raise SSHException(
+                    "Peer window adjustment of {} would overflow the "
+                    "32-bit window (current {})".format(
+                        nbytes, self.out_window_size
+                    )
+                )
             self.out_window_size += nbytes
             self.out_buffer_cv.notify_all()
         finally:

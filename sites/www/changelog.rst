@@ -2,6 +2,18 @@
 Changelog
 =========
 
+- :bug:`- major` Harden handling of window and max-packet sizes advertised by
+  the remote side of a channel. Our own advertised values were already clamped
+  to the RFC range, but values received in ``CHANNEL_OPEN_SUCCESS`` (client
+  side) and ``CHANNEL_OPEN`` (server side) were accepted unchecked, and
+  ``CHANNEL_WINDOW_ADJUST`` increments were added without bounds. A peer could
+  therefore advertise a zero initial window, wedging our send thread forever
+  with a single packet, or push the window past its 32-bit maximum via
+  increments. Out-of-range values are now treated as protocol errors: the
+  offending channel open is rejected (or the transport torn down on the client
+  side / on overflowing window adjustments) instead of being silently clamped.
+  The relaxed lower bound on max packet size is retained for compatibility
+  with common implementations such as OpenSSH.
 - :release:`5.1.0 <2026-10-17>`
 - :release:`5.0.1 <2026-10-17>`
 - :bug:`2462` (w/ earlier fix attempts :issue:`2475` and :issue:`2465`) An API

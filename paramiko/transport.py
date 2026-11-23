@@ -76,6 +76,7 @@ from paramiko.common import (
     MSG_SERVICE_ACCEPT,
     MSG_UNIMPLEMENTED,
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
+    OPEN_FAILED_CONNECT_FAILED,
     OPEN_SUCCEEDED,
     WARNING,
     byte_ord,
@@ -1964,6 +1965,33 @@ class Transport(threading.Thread, ClosingContextManager):
             max_packet_size = self.default_max_packet_size
         return clamp_value(MIN_PACKET_SIZE, max_packet_size, MAX_WINDOW_SIZE)
 
+    def _verify_remote_window_size(self, window_size):
+        # Values we *advertise* are clamped to the RFC range in
+        # _sanitize_window_size, but values advertised by the remote side
+        # cannot be silently clamped: a window of 0 (or an out-of-range value)
+        # would wedge our send thread forever / let increments overflow the
+        # 32-bit window, so treat such values as a protocol error instead.
+        if not (MIN_WINDOW_SIZE <= window_size <= MAX_WINDOW_SIZE):
+            raise SSHException(
+                "Remote window size {!r} is outside the RFC 4254 allowed "
+                "range ({}, {})".format(
+                    window_size, MIN_WINDOW_SIZE, MAX_WINDOW_SIZE
+                )
+            )
+
+    def _verify_remote_packet_size(self, max_packet_size):
+        # Same rationale as _verify_remote_window_size, but note the relaxed
+        # lower bound (MIN_PACKET_SIZE) intentionally accommodates common
+        # implementations such as OpenSSH, which advertise smaller packets
+        # than the RFC minimum.
+        if not (MIN_PACKET_SIZE <= max_packet_size <= MAX_WINDOW_SIZE):
+            raise SSHException(
+                "Remote max packet size {!r} is outside the allowed range "
+                "({}, {})".format(
+                    max_packet_size, MIN_PACKET_SIZE, MAX_WINDOW_SIZE
+                )
+            )
+
     def _ensure_authed(self, ptype, message):
         """
         Checks message type against current auth state.
@@ -2842,6 +2870,11 @@ class Transport(threading.Thread, ClosingContextManager):
         if chan is None:
             self._log(WARNING, "Success for unrequested channel! [??]")
             return
+        # A peer advertising an out-of-range window/packet size is a protocol
+        # error: accepting it (e.g. a zero window) would wedge our send thread
+        # permanently. Raising tears down the transport via the run() loop.
+        self._verify_remote_window_size(server_window_size)
+        self._verify_remote_packet_size(server_max_packet_size)
         self.lock.acquire()
         try:
             chan._set_remote_channel(
@@ -2885,6 +2918,22 @@ class Transport(threading.Thread, ClosingContextManager):
         initial_window_size = m.get_int()
         max_packet_size = m.get_int()
         reject = False
+        # Reject (rather than silently clamp) opens advertising out-of-range
+        # values: a zero/too-small initial window wedges our sends, and values
+        # above the 32-bit maximum overflow the window accounting.
+        try:
+            self._verify_remote_window_size(initial_window_size)
+            self._verify_remote_packet_size(max_packet_size)
+        except SSHException as e:
+            self._log(WARNING, str(e))
+            msg = Message()
+            msg.add_byte(cMSG_CHANNEL_OPEN_FAILURE)
+            msg.add_int(chanid)
+            msg.add_int(OPEN_FAILED_CONNECT_FAILED)
+            msg.add_string(str(e))
+            msg.add_string("en")
+            self._send_message(msg)
+            return
         if (
             kind == "auth-agent@openssh.com"
             and self._forward_agent_handler is not None

@@ -34,6 +34,7 @@ from pytest import mark, raises
 
 from paramiko import (
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
+    OPEN_FAILED_CONNECT_FAILED,
     AuthHandler,
     ChannelException,
     IncompatiblePeer,
@@ -53,12 +54,15 @@ from paramiko.common import (
     MIN_PACKET_SIZE,
     MIN_WINDOW_SIZE,
     MSG_CHANNEL_OPEN,
+    MSG_CHANNEL_OPEN_SUCCESS,
     MSG_DEBUG,
     MSG_IGNORE,
     MSG_KEXINIT,
     MSG_UNIMPLEMENTED,
     MSG_USERAUTH_SUCCESS,
+    byte_ord,
     byte_chr,
+    cMSG_CHANNEL_OPEN_SUCCESS,
     cMSG_CHANNEL_WINDOW_ADJUST,
     cMSG_UNIMPLEMENTED,
 )
@@ -834,6 +838,80 @@ class TransportTest(unittest.TestCase):
         ]:
             self.assertEqual(self.tc._sanitize_window_size(val), correct)
 
+    def test_verify_remote_window_size(self):
+        # In-range values (including the RFC minimum) are accepted as-is.
+        for val in (MIN_WINDOW_SIZE, DEFAULT_WINDOW_SIZE, MAX_WINDOW_SIZE):
+            self.assertIsNone(self.tc._verify_remote_window_size(val))
+        for val in (0, MIN_WINDOW_SIZE - 1, MAX_WINDOW_SIZE + 1):
+            self.assertRaises(
+                SSHException, self.tc._verify_remote_window_size, val
+            )
+
+    def test_verify_remote_packet_size(self):
+        # The relaxed lower bound (smaller than the RFC minimum) must be
+        # retained for compatibility with common implementations.
+        for val in (MIN_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE, MAX_WINDOW_SIZE):
+            self.assertIsNone(self.tc._verify_remote_packet_size(val))
+        for val in (0, MIN_PACKET_SIZE - 1, MAX_WINDOW_SIZE + 1):
+            self.assertRaises(
+                SSHException, self.tc._verify_remote_packet_size, val
+            )
+
+    def test_channel_open_success_with_zero_window_tears_down_transport(self):
+        # A peer advertising a zero (out-of-range) initial window must not be
+        # accepted: otherwise the send thread would block forever waiting for
+        # window that never arrives.
+        self.setup_test_server()
+        real_send_message = self.ts._send_message
+
+        def malicious_send_message(m):
+            m.rewind()
+            ptype = byte_ord(m.get_byte())
+            if ptype == MSG_CHANNEL_OPEN_SUCCESS:
+                chanid = m.get_int()
+                server_chanid = m.get_int()
+                m.get_int()  # original window size
+                max_packet_size = m.get_int()
+                evil = Message()
+                evil.add_byte(cMSG_CHANNEL_OPEN_SUCCESS)
+                evil.add_int(chanid)
+                evil.add_int(server_chanid)
+                evil.add_int(0)
+                evil.add_int(max_packet_size)
+                real_send_message(evil)
+            else:
+                real_send_message(m)
+
+        self.ts._send_message = malicious_send_message
+        with raises(SSHException):
+            self.tc.open_session()
+        # open_channel() consumed saved_exception via get_exception(); the
+        # important remaining signal is that the transport is torn down.
+        self._wait_for_transport_death(self.tc, check_saved_exception=False)
+
+    def test_channel_window_adjust_overflow_tears_down_transport(self):
+        # Window adjustments that would push the window past the 32-bit max
+        # must be rejected instead of overflowing the accounting.
+        self.setup_test_server()
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        self.assertIsNotNone(schan)
+        msg = Message()
+        msg.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+        msg.add_int(chan.chanid)
+        msg.add_int(MAX_WINDOW_SIZE)
+        self.ts._send_message(msg)
+        self._wait_for_transport_death(self.tc)
+
+    @staticmethod
+    def _wait_for_transport_death(transport, check_saved_exception=True):
+        deadline = time.time() + 2
+        while transport.active and time.time() < deadline:
+            time.sleep(0.01)
+        assert not transport.active
+        if check_saved_exception:
+            assert isinstance(transport.saved_exception, SSHException)
+
     @slow
     def test_handshake_timeout(self):
         """
@@ -967,6 +1045,30 @@ class TransportTest(unittest.TestCase):
             assert e.code == OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
         else:
             assert False, "Did not raise ChannelException!"
+
+    def test_server_rejects_open_channel_with_zero_window(self):
+        # Out-of-range values in an incoming CHANNEL_OPEN must be rejected at
+        # the channel level (open failure), not silently clamped and not fatal
+        # to the whole transport.
+        self.setup_test_server()
+        chanid = self.tc._next_channel()
+        msg = Message()
+        msg.add_byte(byte_chr(MSG_CHANNEL_OPEN))
+        msg.add_string("session")
+        msg.add_int(chanid)
+        msg.add_int(0)
+        msg.add_int(DEFAULT_MAX_PACKET_SIZE)
+        self.tc._send_message(msg)
+
+        deadline = time.time() + 2
+        while self.ts.active and time.time() < deadline:
+            if self.tc.saved_exception is not None:
+                break
+            time.sleep(0.01)
+        # Transport stays up; the open failed with a channel-level error.
+        assert self.ts.active
+        assert isinstance(self.tc.saved_exception, ChannelException)
+        assert self.tc.saved_exception.code == OPEN_FAILED_CONNECT_FAILED
 
     def test_server_rejects_arbitrary_global_request_without_auth(self):
         self.setup_test_server(connect_kwargs={})
