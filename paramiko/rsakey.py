@@ -45,6 +45,10 @@ class RSAKey(PKey):
         "rsa-sha2-512": hashes.SHA512,
         "rsa-sha2-512-cert-v01@openssh.com": hashes.SHA512,
     }
+    SIG_HASHES = {
+        "rsa-sha2-256": hashes.SHA256,
+        "rsa-sha2-512": hashes.SHA512,
+    }
 
     def __init__(
         self,
@@ -153,7 +157,7 @@ class RSAKey(PKey):
 
     def verify_ssh_sig(self, data, msg):
         sig_algorithm = msg.get_text()
-        if sig_algorithm not in self.HASHES:
+        if sig_algorithm not in self.SIG_HASHES:
             return False
         key = self.key
         if isinstance(key, rsa.RSAPrivateKey):
@@ -168,7 +172,10 @@ class RSAKey(PKey):
 
         try:
             key.verify(
-                sign, data, padding.PKCS1v15(), self.HASHES[sig_algorithm]()
+                sign,
+                data,
+                padding.PKCS1v15(),
+                self.SIG_HASHES[sig_algorithm](),
             )
         except InvalidSignature:
             return False
