@@ -22,6 +22,7 @@ import os
 import re
 from base64 import decodebytes, encodebytes
 from collections.abc import MutableMapping
+from enum import Enum
 from hashlib import sha1
 from hmac import HMAC
 
@@ -51,6 +52,7 @@ class HostKeys(MutableMapping):
         """
         # emulate a dict of { hostname: { keytype: PKey } }
         self._entries = []
+        self._revoked = []
         if filename is not None:
             self.load(filename)
 
@@ -91,15 +93,19 @@ class HostKeys(MutableMapping):
                     continue
                 try:
                     entry = HostKeyEntry.from_line(line, lineno)
-                except SSHException:
+                except (SSHException, InvalidHostKey):
                     continue
-                if entry is not None:
-                    _hostnames = entry.hostnames
-                    for h in _hostnames:
-                        if self.check(h, entry.key):
-                            entry.hostnames.remove(h)
-                    if len(entry.hostnames):
-                        self._entries.append(entry)
+                if entry is None:
+                    continue
+                if entry.marker is HostKeyMarkers.REVOKED:
+                    self._revoked.append(entry)
+                    continue
+                _hostnames = list(entry.hostnames)
+                for h in _hostnames:
+                    if self._pinned_key_matches(h, entry.key):
+                        entry.hostnames.remove(h)
+                if len(entry.hostnames):
+                    self._entries.append(entry)
 
     def save(self, filename):
         """
@@ -115,10 +121,11 @@ class HostKeys(MutableMapping):
         .. versionadded:: 1.6.1
         """
         with open(filename, "w") as f:
-            for e in self._entries:
-                line = e.to_line()
-                if line:
-                    f.write(line)
+            for entries in (self._entries, self._revoked):
+                for e in entries:
+                    line = e.to_line()
+                    if line:
+                        f.write(line)
 
     def lookup(self, hostname):
         """
@@ -213,6 +220,12 @@ class HostKeys(MutableMapping):
         :return:
             ``True`` if the key is associated with the hostname; else ``False``
         """
+        if self._is_revoked(key):
+            return False
+        return self._pinned_key_matches(hostname, key)
+
+    def _pinned_key_matches(self, hostname, key):
+        """Return True if ``key`` is the pinned key for ``hostname``."""
         k = self.lookup(hostname)
         if k is None:
             return False
@@ -221,11 +234,31 @@ class HostKeys(MutableMapping):
             return False
         return host_key.asbytes() == key.asbytes()
 
+    def _is_revoked(self, key):
+        key_bytes = key.asbytes()
+        for entry in self._revoked:
+            if entry.key is not None and entry.key.asbytes() == key_bytes:
+                return True
+        return False
+
+    def is_revoked(self, key):
+        """
+        Return True if the given key has been marked as revoked.
+
+        Revocation is not scoped to a particular hostname: a key listed on an
+        OpenSSH ``@revoked`` line must never be accepted.
+
+        :param .PKey key: the key to check
+        :return: ``True`` if the key is revoked; else ``False``
+        """
+        return self._is_revoked(key)
+
     def clear(self):
         """
         Remove all host keys from the dictionary.
         """
         self._entries = []
+        self._revoked = []
 
     def __iter__(self):
         for k in self.keys():
@@ -302,11 +335,20 @@ class HostKeys(MutableMapping):
         return hostkey.replace("\n", "")
 
 
-class InvalidHostKey(Exception):
+class InvalidHostKey(SSHException):
     def __init__(self, line, exc):
         self.line = line
         self.exc = exc
         self.args = (line, exc)
+
+
+class HostKeyMarkers(str, Enum):
+    """
+    Markers which may appear at the start of an OpenSSH known_hosts line.
+    """
+
+    CERT_AUTHORITY = "@cert-authority"
+    REVOKED = "@revoked"
 
 
 class HostKeyEntry:
@@ -314,10 +356,17 @@ class HostKeyEntry:
     Representation of a line in an OpenSSH-style "known hosts" file.
     """
 
-    def __init__(self, hostnames=None, key=None):
+    def __init__(self, hostnames=None, key=None, marker=None, comment=None):
         self.valid = (hostnames is not None) and (key is not None)
         self.hostnames = hostnames
         self.key = key
+        if marker is not None and not isinstance(marker, HostKeyMarkers):
+            try:
+                marker = HostKeyMarkers(marker)
+            except ValueError:
+                pass
+        self.marker = marker
+        self.comment = comment
 
     @classmethod
     def from_line(cls, line, lineno=None):
@@ -335,14 +384,24 @@ class HostKeyEntry:
         """
         log = get_logger("paramiko.hostkeys")
         fields = re.split(" |\t", line)
+        marker = None
+        if fields:
+            try:
+                marker = HostKeyMarkers(fields[0])
+            except ValueError:
+                pass
+            else:
+                fields = fields[1:]
+        # A trailing comment is allowed and must not be mistaken for part of
+        # the key or hostname fields.
         if len(fields) < 3:
             # Bad number of fields
             msg = "Not enough fields found in known_hosts in line {} ({!r})"
             log.info(msg.format(lineno, line))
             return None
-        fields = fields[:3]
 
-        names, key_type, key = fields
+        names, key_type, key = fields[:3]
+        comment = " ".join(fields[3:]) or None
         names = names.split(",")
 
         # Decide what kind of key we're looking at and create an object
@@ -357,7 +416,12 @@ class HostKeyEntry:
             raise InvalidHostKey(line, e)
 
         try:
-            return cls(names, PKey.from_type_string(key_type, key_bytes))
+            return cls(
+                names,
+                PKey.from_type_string(key_type, key_bytes),
+                marker=marker,
+                comment=comment,
+            )
         except UnknownKeyType:
             # TODO (backwards incompat): consider changing HostKeys API so this
             # just raises naturally and the exception is muted higher up in the
@@ -372,11 +436,19 @@ class HostKeyEntry:
         included.
         """
         if self.valid:
-            return "{} {} {}\n".format(
-                ",".join(self.hostnames),
-                self.key.get_name(),
-                self.key.get_base64(),
+            fields = []
+            if self.marker is not None:
+                fields.append(self.marker.value)
+            fields.extend(
+                [
+                    ",".join(self.hostnames),
+                    self.key.get_name(),
+                    self.key.get_base64(),
+                ]
             )
+            if self.comment:
+                fields.append(self.comment)
+            return " ".join(fields) + "\n"
         return None
 
     def __repr__(self):

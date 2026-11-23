@@ -140,14 +140,7 @@ class SSHClient(ClosingContextManager):
         if self._host_keys_filename is not None:
             self.load_host_keys(self._host_keys_filename)
 
-        with open(filename, "w") as f:
-            for hostname, keys in self._host_keys.items():
-                for keytype, key in keys.items():
-                    f.write(
-                        "{} {} {}\n".format(
-                            hostname, keytype, key.get_base64()
-                        )
-                    )
+        self._host_keys.save(filename)
 
     def get_host_keys(self):
         """
@@ -406,16 +399,16 @@ class SSHClient(ClosingContextManager):
             server_hostkey_name = hostname
         else:
             server_hostkey_name = "[{}]:{}".format(hostname, port)
-        our_server_keys = None
-
-        our_server_keys = self._system_host_keys.get(server_hostkey_name)
+        our_host_keys = self._system_host_keys
+        our_server_keys = our_host_keys.get(server_hostkey_name)
         if our_server_keys is None:
             # TODO: this is getting us the test suite _test_connection host key
             # setup by virtue of that code doing tc.get_host_keys().add() (that
             # method wraps self._host_keys)
             # TODO: it should be analogous to running paramiko w/ a
             # ~/.ssh/known_hosts file
-            our_server_keys = self._host_keys.get(server_hostkey_name)
+            our_host_keys = self._host_keys
+            our_server_keys = our_host_keys.get(server_hostkey_name)
         if our_server_keys is not None:
             # TODO: keytype needs to turn into one of the rsa-sha2 keys if it's
             # an RSAKey.
@@ -443,12 +436,18 @@ class SSHClient(ClosingContextManager):
         t.start_client(timeout=timeout)
 
         server_key = t.get_remote_server_key()
-        if our_server_keys is None:
+        if self._system_host_keys.is_revoked(
+            server_key
+        ) or self._host_keys.is_revoked(server_key):
+            raise BadHostKeyException(hostname, server_key, server_key)
+
+        trusted = our_host_keys.check(server_hostkey_name, server_key)
+        if not trusted and our_server_keys is None:
             # will raise exception if the key is rejected
             self._policy.missing_host_key(
                 self, server_hostkey_name, server_key
             )
-        else:
+        elif not trusted:
             # TODO: this should 'just work' but dblcheck (HostKeys will be
             # offering an ssh-rsa-via-sha2 key as "ssh-rsa" still, and the
             # key would be RSAKey whose .get_name would still say
